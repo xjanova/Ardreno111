@@ -192,6 +192,12 @@ if (Get-Command arduino-cli -ErrorAction SilentlyContinue) {
     Write-OK "Arduino CLI installed to $ArduinoDir"
 }
 
+# Add ESP32 board manager URL
+Write-Host "   Adding ESP32 board support..."
+arduino-cli config init 2>$null
+arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json 2>$null
+Write-OK "ESP32 board URL added"
+
 # Update board index
 Write-Host "   Updating board index..."
 arduino-cli core update-index 2>&1 | Out-Null
@@ -213,14 +219,21 @@ if ($board.Port -and $board.Fqbn) {
     arduino-cli core install $coreName 2>&1 | Out-Null
     Write-OK "Core '$coreName' installed"
 } else {
-    Write-Warn "No Arduino board detected right now."
+    Write-Warn "No board detected right now."
     Write-Warn "Installing common cores as fallback..."
     arduino-cli core install arduino:avr 2>&1 | Out-Null
-    Write-OK "Core 'arduino:avr' installed (covers Uno, Nano, Mega)"
+    arduino-cli core install esp32:esp32 2>&1 | Out-Null
+    Write-OK "Cores installed: arduino:avr + esp32:esp32"
     Write-Host ""
-    Write-Host "   Plug in your Arduino and the system will auto-detect it" -ForegroundColor Yellow
+    Write-Host "   Plug in your board and the system will auto-detect it" -ForegroundColor Yellow
     Write-Host "   when the workflow runs." -ForegroundColor Yellow
 }
+
+# Install required libraries
+Write-Step "Phase 6b: Install Arduino Libraries"
+Write-Host "   Installing InfluxDB client library..."
+arduino-cli lib install "ESP8266 Influxdb" 2>&1 | Out-Null
+Write-OK "Library 'ESP8266 Influxdb' installed"
 
 # ── PHASE 7: GitHub Actions Runner ──────────────────────────
 Write-Step "Phase 7: GitHub Actions Runner"
