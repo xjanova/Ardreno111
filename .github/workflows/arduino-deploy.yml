@@ -12,6 +12,7 @@ jobs:
     timeout-minutes: 10
 
     strategy:
+      fail-fast: false
       matrix:
         sketch: [sketches/server, sketches/client, sketches/blink]
 

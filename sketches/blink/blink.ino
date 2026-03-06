@@ -1,9 +1,13 @@
 /*
  * blink.ino — Test sketch for Arduino Auto-Deploy System
  *
- * LED blinks on built-in LED (pin 13 on most boards).
- * If this uploads successfully, your CI/CD pipeline works!
+ * LED blinks on built-in LED.
+ * ESP32: GPIO 2, Arduino Uno: pin 13
  */
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
