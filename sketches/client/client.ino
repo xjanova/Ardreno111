@@ -93,12 +93,6 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.printf("Connecting to WiFi '%s'...\n", WIFI_SSID);
 
-  // --- InfluxDB ---
-  if (influxClient.validateConnection()) {
-    Serial.println("InfluxDB connected OK");
-  } else {
-    Serial.printf("InfluxDB error: %s\n", influxClient.getLastErrorMessage().c_str());
-  }
 }
 
 // ╔══════════════════════════════════════════════════════════╗
@@ -109,6 +103,9 @@ void loop() {
 
   // ── [1] WiFi → LED1 ─────────────────────────────────────
   if (WiFi.status() != WL_CONNECTED) {
+    // WiFi dropped while connected → clean up
+    if (serverConnected) disconnectFromServer();
+
     // Blink LED1 while connecting
     if (millis() - lastBlink > 500) {
       led1Blink = !led1Blink;
@@ -127,6 +124,12 @@ void loop() {
     Serial.printf("WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("Server target: %s:%d\n", SERVER_IP, SERVER_PORT);
     Serial.println("Press SW1 to connect to server...");
+
+    if (influxClient.validateConnection()) {
+      Serial.println("InfluxDB connected OK");
+    } else {
+      Serial.printf("InfluxDB error: %s\n", influxClient.getLastErrorMessage().c_str());
+    }
     ipPrinted = true;
   }
 
@@ -164,6 +167,8 @@ void loop() {
 
     // --- [6] Every 3 seconds → send QUERY ---
     if (millis() - lastQuery >= 3000) {
+      lastQuery = millis();  // reset timer BEFORE blocking wait
+
       tcpClient.println("QUERY");
       Serial.println("[QUERY] Sent to server");
 
@@ -185,8 +190,6 @@ void loop() {
       } else {
         Serial.println("[QUERY] No response (timeout)");
       }
-
-      lastQuery = millis();
     }
 
     // --- [7] sw4 → disconnect ---

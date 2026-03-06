@@ -62,8 +62,6 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 // PWM config
 #define PWM_FREQ       5000
 #define PWM_RESOLUTION 8      // 0-255
-#define PWM_CH_LED3    0
-#define PWM_CH_LED4    1
 
 // ╔══════════════════════════════════════════════════════════╗
 // ║  GLOBALS                                                ║
@@ -94,17 +92,15 @@ void setup() {
   pinMode(PIN_LED2, OUTPUT);
   pinMode(PIN_SW4, INPUT_PULLUP);
 
-  // PWM for LED3, LED4 (brightness control)
-  ledcSetup(PWM_CH_LED3, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PIN_LED3, PWM_CH_LED3);
-  ledcSetup(PWM_CH_LED4, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PIN_LED4, PWM_CH_LED4);
+  // PWM for LED3, LED4 (brightness control) — ESP32 Core 3.x API
+  ledcAttach(PIN_LED3, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(PIN_LED4, PWM_FREQ, PWM_RESOLUTION);
 
   // All LEDs off
   digitalWrite(PIN_LED1, LOW);
   digitalWrite(PIN_LED2, LOW);
-  ledcWrite(PWM_CH_LED3, 0);
-  ledcWrite(PWM_CH_LED4, 0);
+  ledcWrite(PIN_LED3, 0);
+  ledcWrite(PIN_LED4, 0);
 
   // --- WiFi ---
   WiFi.mode(WIFI_STA);
@@ -115,12 +111,6 @@ void setup() {
   tcpServer.begin();
   tcpServer.setNoDelay(true);
 
-  // --- InfluxDB ---
-  if (influxClient.validateConnection()) {
-    Serial.println("InfluxDB connected OK");
-  } else {
-    Serial.printf("InfluxDB error: %s\n", influxClient.getLastErrorMessage().c_str());
-  }
 }
 
 // ╔══════════════════════════════════════════════════════════╗
@@ -131,6 +121,9 @@ void loop() {
 
   // ── [1] WiFi → LED1 ─────────────────────────────────────
   if (WiFi.status() != WL_CONNECTED) {
+    // WiFi dropped while client was connected → clean up
+    if (clientConnected) disconnectClient();
+
     // Blink LED1 while connecting
     if (millis() - lastBlink > 500) {
       led1Blink = !led1Blink;
@@ -144,11 +137,17 @@ void loop() {
   // WiFi connected → LED1 solid ON
   digitalWrite(PIN_LED1, HIGH);
 
-  // Print IP once
+  // Print IP once + validate InfluxDB after WiFi is up
   static bool ipPrinted = false;
   if (!ipPrinted) {
     Serial.printf("WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("TCP Server listening on port %d\n", TCP_PORT);
+
+    if (influxClient.validateConnection()) {
+      Serial.println("InfluxDB connected OK");
+    } else {
+      Serial.printf("InfluxDB error: %s\n", influxClient.getLastErrorMessage().c_str());
+    }
     ipPrinted = true;
   }
 
@@ -217,8 +216,8 @@ void loop() {
     }
 
     // LED3 brightness = VR1, LED4 brightness = VR2
-    ledcWrite(PWM_CH_LED3, map(vr1Raw, 0, 4095, 0, 255));
-    ledcWrite(PWM_CH_LED4, map(vr2Raw, 0, 4095, 0, 255));
+    ledcWrite(PIN_LED3, map(vr1Raw, 0, 4095, 0, 255));
+    ledcWrite(PIN_LED4, map(vr2Raw, 0, 4095, 0, 255));
 
     // InfluxDB every 2 seconds
     if (millis() - lastInflux >= 2000) {
@@ -237,8 +236,8 @@ void loop() {
   } else {
     // ── [4][8] Not connected → LED2, LED3, LED4 OFF ──────
     digitalWrite(PIN_LED2, LOW);
-    ledcWrite(PWM_CH_LED3, 0);
-    ledcWrite(PWM_CH_LED4, 0);
+    ledcWrite(PIN_LED3, 0);
+    ledcWrite(PIN_LED4, 0);
   }
 
   delay(50);
@@ -283,8 +282,8 @@ void disconnectClient() {
 
   // [4][8] ดับ LED2, LED3, LED4
   digitalWrite(PIN_LED2, LOW);
-  ledcWrite(PWM_CH_LED3, 0);
-  ledcWrite(PWM_CH_LED4, 0);
+  ledcWrite(PIN_LED3, 0);
+  ledcWrite(PIN_LED4, 0);
 
   Serial.println("[CONN] Disconnected → LED2, LED3, LED4 OFF");
 }
