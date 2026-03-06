@@ -1,0 +1,528 @@
+name: Arduino Deploy
+
+on:
+  push:
+    paths:
+      - 'sketches/**'
+  workflow_dispatch:
+    inputs:
+      sketch:
+        description: 'Sketch folder (e.g. sketches/blink)'
+        required: false
+        default: ''
+
+jobs:
+  compile-and-upload:
+    runs-on: [self-hosted, windows, arduino-windows]
+    timeout-minutes: 10
+
+    steps:
+      # ────────────────────────────────────────────────────────
+      #  CHECKOUT
+      # ────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # ────────────────────────────────────────────────────────
+      #  ENVIRONMENT REPORT
+      # ────────────────────────────────────────────────────────
+      - name: Report environment
+        id: env
+        shell: pwsh
+        run: |
+          $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+          $hostname  = $env:COMPUTERNAME
+          $user      = $env:USERNAME
+          $os        = (Get-CimInstance Win32_OperatingSystem).Caption
+
+          # arduino-cli version
+          $cliVersion = "NOT INSTALLED"
+          try { $cliVersion = (arduino-cli version 2>$null) -replace 'arduino-cli\s+', '' } catch {}
+
+          # Write to summary
+          @"
+          ## Environment
+          | Item | Value |
+          |------|-------|
+          | Runner | ``$hostname`` |
+          | OS | $os |
+          | User | ``$user`` |
+          | arduino-cli | ``$cliVersion`` |
+          | Timestamp | $timestamp |
+          | Commit | ``${{ github.sha }}`` |
+          | Trigger | ``${{ github.event_name }}`` |
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+          echo "timestamp=$timestamp" >> $env:GITHUB_OUTPUT
+          echo "cli_version=$cliVersion" >> $env:GITHUB_OUTPUT
+
+          if ($cliVersion -eq "NOT INSTALLED") {
+            "::error title=arduino-cli Missing::arduino-cli is not installed on this runner. Run install_runner.ps1 first."
+            @"
+
+            > **FATAL: arduino-cli is not installed on this runner.**
+            > Run ``install_runner.ps1`` on the runner machine.
+            "@ >> $env:GITHUB_STEP_SUMMARY
+            exit 1
+          }
+
+      # ────────────────────────────────────────────────────────
+      #  DETECT BOARD
+      # ────────────────────────────────────────────────────────
+      - name: Auto-detect Arduino board
+        id: board
+        shell: pwsh
+        run: |
+          Write-Host "Scanning for Arduino boards..."
+
+          # Raw board list for logs
+          $boardListRaw = arduino-cli board list 2>&1 | Out-String
+          Write-Host $boardListRaw
+
+          $port = $null
+          $fqbn = $null
+          $boardName = "Unknown"
+          $detectMethod = "auto-detect"
+
+          try {
+            $raw  = arduino-cli board list --format json 2>$null
+            $json = $raw | ConvertFrom-Json
+
+            if ($json.detected_ports) {
+              $found = $json.detected_ports |
+                Where-Object { $_.matching_boards -and $_.matching_boards.Count -gt 0 } |
+                Select-Object -First 1
+              if ($found) {
+                $port      = $found.port.address
+                $fqbn      = $found.matching_boards[0].fqbn
+                $boardName = $found.matching_boards[0].name
+              }
+            }
+            elseif ($json -is [array]) {
+              $found = $json |
+                Where-Object { $_.boards -and $_.boards.Count -gt 0 } |
+                Select-Object -First 1
+              if ($found) {
+                $port      = $found.address
+                $fqbn      = $found.boards[0].fqbn
+                $boardName = $found.boards[0].name
+              }
+            }
+          } catch {
+            Write-Host "JSON parse error: $_"
+          }
+
+          # Fallback to secrets
+          if (-not $port -and "${{ secrets.ARDUINO_PORT }}") {
+            $port = "${{ secrets.ARDUINO_PORT }}"
+            $detectMethod = "secret"
+          }
+          if (-not $fqbn -and "${{ secrets.ARDUINO_FQBN }}") {
+            $fqbn = "${{ secrets.ARDUINO_FQBN }}"
+            $detectMethod = "secret"
+          }
+
+          # FAIL: no board
+          if (-not $port -or -not $fqbn) {
+            "::error title=No Arduino Detected::No Arduino board found. Check USB connection or set ARDUINO_PORT and ARDUINO_FQBN secrets."
+
+            @"
+
+            ## Board Detection: FAILED
+            ``````
+            $boardListRaw
+            ``````
+
+            > **No Arduino board detected.**
+            >
+            > **Possible causes:**
+            > 1. Arduino is not plugged in via USB
+            > 2. USB cable is charge-only (no data)
+            > 3. Driver not installed — check Device Manager
+            > 4. Another program is locking the COM port
+            >
+            > **Quick fix:** Set repo secrets ``ARDUINO_PORT`` (e.g. ``COM3``) and ``ARDUINO_FQBN`` (e.g. ``arduino:avr:uno``)
+            "@ >> $env:GITHUB_STEP_SUMMARY
+            exit 1
+          }
+
+          # SUCCESS
+          echo "port=$port" >> $env:GITHUB_OUTPUT
+          echo "fqbn=$fqbn" >> $env:GITHUB_OUTPUT
+          echo "board_name=$boardName" >> $env:GITHUB_OUTPUT
+
+          @"
+
+          ## Board Detection: OK
+          | Item | Value |
+          |------|-------|
+          | Board | **$boardName** |
+          | FQBN | ``$fqbn`` |
+          | Port | ``$port`` |
+          | Method | $detectMethod |
+
+          <details><summary>Raw board list</summary>
+
+          ``````
+          $boardListRaw
+          ``````
+          </details>
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      # ────────────────────────────────────────────────────────
+      #  FIND SKETCH
+      # ────────────────────────────────────────────────────────
+      - name: Find sketch to deploy
+        id: sketch
+        shell: pwsh
+        run: |
+          $manualInput = "${{ github.event.inputs.sketch }}"
+
+          if ($manualInput) {
+            $sketchPath = $manualInput
+            $sketchSource = "manual input"
+          } else {
+            $changedFiles = git diff --name-only HEAD~1 HEAD -- sketches/ 2>$null
+            if ($changedFiles) {
+              $firstFile = ($changedFiles -split "`n" | Where-Object { $_ })[0]
+              $parts = $firstFile -split '/'
+              if ($parts.Count -ge 2) {
+                $sketchPath = "$($parts[0])/$($parts[1])"
+              } else {
+                $sketchPath = "sketches/blink"
+              }
+              $sketchSource = "git diff (changed files: $($changedFiles -split "`n" | Measure-Object | Select-Object -Expand Count))"
+            } else {
+              $sketchPath = "sketches/blink"
+              $sketchSource = "default fallback"
+            }
+          }
+
+          # Verify
+          $inoFiles = Get-ChildItem -Path $sketchPath -Filter "*.ino" -ErrorAction SilentlyContinue
+          if (-not $inoFiles) {
+            "::error title=Sketch Not Found::No .ino file in $sketchPath"
+
+            $available = Get-ChildItem -Path sketches -Directory -ErrorAction SilentlyContinue |
+              ForEach-Object { "- ``sketches/$($_.Name)``" }
+
+            @"
+
+            ## Sketch Detection: FAILED
+            > **No .ino file found in ``$sketchPath``**
+            >
+            > Available sketches:
+            $($available -join "`n")
+            "@ >> $env:GITHUB_STEP_SUMMARY
+            exit 1
+          }
+
+          # Read sketch content for report
+          $inoFile = $inoFiles[0].FullName
+          $inoContent = Get-Content $inoFile -Raw
+          $lineCount = ($inoContent -split "`n").Count
+
+          echo "path=$sketchPath" >> $env:GITHUB_OUTPUT
+          echo "ino_file=$($inoFiles[0].Name)" >> $env:GITHUB_OUTPUT
+
+          @"
+
+          ## Sketch: ``$sketchPath``
+          | Item | Value |
+          |------|-------|
+          | File | ``$($inoFiles[0].Name)`` |
+          | Lines | $lineCount |
+          | Source | $sketchSource |
+
+          <details><summary>Source code</summary>
+
+          ``````cpp
+          $inoContent
+          ``````
+          </details>
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      # ────────────────────────────────────────────────────────
+      #  COMPILE
+      # ────────────────────────────────────────────────────────
+      - name: Compile sketch
+        id: compile
+        shell: pwsh
+        run: |
+          $fqbn   = "${{ steps.board.outputs.fqbn }}"
+          $sketch = "${{ steps.sketch.outputs.path }}"
+
+          Write-Host "Compiling $sketch for $fqbn..."
+
+          $compileOutput = arduino-cli compile --fqbn $fqbn $sketch --verbose 2>&1 | Out-String
+          $compileExit = $LASTEXITCODE
+
+          Write-Host $compileOutput
+
+          # Extract binary size if compile succeeded
+          $sizeInfo = ""
+          if ($compileOutput -match 'Sketch uses (\d+) bytes.*?Maximum is (\d+) bytes') {
+            $used = $Matches[1]
+            $max  = $Matches[2]
+            $pct  = [math]::Round(([int]$used / [int]$max) * 100, 1)
+            $sizeInfo = "| Flash | $used / $max bytes ($pct%) |"
+          }
+          if ($compileOutput -match 'Global variables use (\d+) bytes.*?Maximum is (\d+) bytes') {
+            $ramUsed = $Matches[1]
+            $ramMax  = $Matches[2]
+            $ramPct  = [math]::Round(([int]$ramUsed / [int]$ramMax) * 100, 1)
+            $sizeInfo += "`n| RAM | $ramUsed / $ramMax bytes ($ramPct%) |"
+          }
+
+          if ($compileExit -ne 0) {
+            # Extract the actual error lines
+            $errorLines = $compileOutput -split "`n" |
+              Where-Object { $_ -match '(error:|Error|fatal|undefined|expected|undeclared)' } |
+              ForEach-Object { $_.Trim() }
+
+            $errorSummary = if ($errorLines) { $errorLines -join "`n" } else { "See full log below" }
+
+            # Annotate errors on specific files
+            if ($compileOutput -match '([^:\s]+\.ino):(\d+):\d+: error: (.+)') {
+              "::error file=$sketch/$($Matches[1]),line=$($Matches[2]),title=Compile Error::$($Matches[3])"
+            } else {
+              "::error title=Compile Failed::Sketch $sketch failed to compile for $fqbn"
+            }
+
+            @"
+
+            ## Compile: FAILED
+            **Board:** ``$fqbn`` | **Sketch:** ``$sketch``
+
+            ### Error Summary
+            ``````
+            $errorSummary
+            ``````
+
+            <details><summary>Full compile log</summary>
+
+            ``````
+            $compileOutput
+            ``````
+            </details>
+
+            ### Common Fixes
+            | Error Type | Fix |
+            |-----------|-----|
+            | ``undeclared identifier`` | Variable or function not defined. Check spelling. |
+            | ``expected ';'`` | Missing semicolon at end of line. |
+            | ``no matching function`` | Wrong argument types. Check function signature. |
+            | ``library not found`` | Run ``arduino-cli lib install <name>`` on runner. |
+            | ``board not found`` | Wrong FQBN. Currently: ``$fqbn`` |
+            "@ >> $env:GITHUB_STEP_SUMMARY
+            exit 1
+          }
+
+          # SUCCESS
+          @"
+
+          ## Compile: OK
+          | Item | Value |
+          |------|-------|
+          | Board | ``$fqbn`` |
+          $sizeInfo
+
+          <details><summary>Full compile log</summary>
+
+          ``````
+          $compileOutput
+          ``````
+          </details>
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      # ────────────────────────────────────────────────────────
+      #  UPLOAD (with retry)
+      # ────────────────────────────────────────────────────────
+      - name: Upload to Arduino
+        id: upload
+        shell: pwsh
+        run: |
+          $port   = "${{ steps.board.outputs.port }}"
+          $fqbn   = "${{ steps.board.outputs.fqbn }}"
+          $sketch = "${{ steps.sketch.outputs.path }}"
+          $maxAttempts = 2
+          $allLogs = ""
+
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "`n=== Upload attempt $attempt/$maxAttempts (Port: $port) ==="
+
+            $uploadOutput = arduino-cli upload -p $port --fqbn $fqbn $sketch --verbose 2>&1 | Out-String
+            $uploadExit = $LASTEXITCODE
+
+            Write-Host $uploadOutput
+            $allLogs += "`n--- Attempt $attempt (Port: $port) ---`n$uploadOutput"
+
+            if ($uploadExit -eq 0) {
+              @"
+
+              ## Upload: OK (attempt $attempt/$maxAttempts)
+              | Item | Value |
+              |------|-------|
+              | Port | ``$port`` |
+              | Board | ``$fqbn`` |
+              | Sketch | ``$sketch`` |
+              | Attempts | $attempt |
+
+              <details><summary>Upload log</summary>
+
+              ``````
+              $uploadOutput
+              ``````
+              </details>
+              "@ >> $env:GITHUB_STEP_SUMMARY
+              exit 0
+            }
+
+            # Retry logic
+            if ($attempt -lt $maxAttempts) {
+              Write-Host "Upload failed. Re-detecting board in 5s..."
+              Start-Sleep -Seconds 5
+
+              try {
+                $raw = arduino-cli board list --format json 2>$null
+                $json = $raw | ConvertFrom-Json
+                if ($json.detected_ports) {
+                  $newBoard = $json.detected_ports |
+                    Where-Object { $_.matching_boards -and $_.matching_boards.Count -gt 0 } |
+                    Select-Object -First 1
+                  if ($newBoard) {
+                    $newPort = $newBoard.port.address
+                    if ($newPort -ne $port) {
+                      Write-Host "Port changed: $port -> $newPort"
+                      $port = $newPort
+                    }
+                  }
+                }
+              } catch {}
+            }
+          }
+
+          # ALL ATTEMPTS FAILED
+          $boardListNow = arduino-cli board list 2>&1 | Out-String
+
+          "::error title=Upload Failed::Failed to upload to $port after $maxAttempts attempts"
+
+          @"
+
+          ## Upload: FAILED (all $maxAttempts attempts)
+          | Item | Value |
+          |------|-------|
+          | Port | ``$port`` |
+          | Board | ``$fqbn`` |
+          | Sketch | ``$sketch`` |
+          | Attempts | $maxAttempts |
+
+          ### Current Board Status
+          ``````
+          $boardListNow
+          ``````
+
+          ### Troubleshooting
+          | Check | Action |
+          |-------|--------|
+          | USB connected? | Verify cable is plugged in on both ends |
+          | Data cable? | Some USB cables are charge-only |
+          | Port locked? | Close Serial Monitor / Arduino IDE / PuTTY |
+          | Correct port? | Check Device Manager for COM port number |
+          | Driver OK? | Reinstall CH340/FTDI/Arduino driver |
+          | Board responsive? | Try unplugging and replugging USB |
+
+          <details><summary>Full upload logs (all attempts)</summary>
+
+          ``````
+          $allLogs
+          ``````
+          </details>
+          "@ >> $env:GITHUB_STEP_SUMMARY
+          exit 1
+
+      # ────────────────────────────────────────────────────────
+      #  FINAL SUMMARY
+      # ────────────────────────────────────────────────────────
+      - name: Deploy summary
+        if: success()
+        shell: pwsh
+        run: |
+          @"
+
+          ---
+          ## DEPLOY COMPLETE
+          **${{ steps.sketch.outputs.path }}** is running on **${{ steps.board.outputs.board_name }}** (``${{ steps.board.outputs.port }}``)
+
+          Commit: ``${{ github.sha }}`` | Trigger: ``${{ github.event_name }}``
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      # ────────────────────────────────────────────────────────
+      #  FAILURE SUMMARY (runs even if earlier steps failed)
+      # ────────────────────────────────────────────────────────
+      - name: Failure summary
+        if: failure()
+        shell: pwsh
+        run: |
+          @"
+
+          ---
+          ## DEPLOY FAILED
+
+          Check the sections above for detailed error information.
+
+          **Quick debug commands (run on runner machine):**
+          ``````powershell
+          # Check board connection
+          arduino-cli board list
+
+          # Test compile locally (replace <FQBN> and <SKETCH> if empty)
+          arduino-cli compile --fqbn ${{ steps.board.outputs.fqbn || 'arduino:avr:uno' }} ${{ steps.sketch.outputs.path || 'sketches/blink' }} --verbose
+
+          # Test upload locally (replace <PORT> if empty)
+          arduino-cli upload -p ${{ steps.board.outputs.port || 'COM3' }} --fqbn ${{ steps.board.outputs.fqbn || 'arduino:avr:uno' }} ${{ steps.sketch.outputs.path || 'sketches/blink' }} --verbose
+
+          # Or use the helper script (auto-detects everything)
+          .\deploy.ps1
+          ``````
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      # ────────────────────────────────────────────────────────
+      #  UPLOAD LOGS AS ARTIFACT (always, for debugging)
+      # ────────────────────────────────────────────────────────
+      - name: Collect debug logs
+        if: always()
+        shell: pwsh
+        run: |
+          $logDir = "deploy-logs"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+          # Board info
+          arduino-cli board list 2>&1 | Out-File "$logDir/board-list.txt"
+          arduino-cli board list --format json 2>&1 | Out-File "$logDir/board-list.json"
+
+          # Core info
+          arduino-cli core list 2>&1 | Out-File "$logDir/core-list.txt"
+
+          # arduino-cli version
+          arduino-cli version 2>&1 | Out-File "$logDir/cli-version.txt"
+
+          # Runner info
+          @"
+          Hostname: $env:COMPUTERNAME
+          User: $env:USERNAME
+          OS: $((Get-CimInstance Win32_OperatingSystem).Caption)
+          Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+          "@ | Out-File "$logDir/runner-info.txt"
+
+          Write-Host "Debug logs collected in $logDir/"
+
+      - name: Upload debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-logs-${{ github.run_number }}
+          path: deploy-logs/
+          retention-days: 30

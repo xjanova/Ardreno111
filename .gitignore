@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+*.hex
+*.elf
+*.bin
+
+# Arduino CLI cache
+.arduino/
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# IDE
+.vscode/
+*.swp
+*.swo
+*.bak
